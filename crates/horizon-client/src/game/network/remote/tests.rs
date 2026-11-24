@@ -714,6 +714,74 @@ fn mods_replace_and_cancel_received_chat() {
     });
 }
 
+/// `ChatListener.handleSystemMessage`: with Hide Matched Names on (its default), a system
+/// line's `<Name>` is matched against the player list's discovered names, and a hidden
+/// player's line is dropped even after their player-list entry is gone.
+#[test]
+#[ignore = "daily"]
+fn hide_matched_names_drops_hidden_players_system_chat() {
+    use super::super::native_entity_refs::tests::with_client_game;
+    use horizon_core::nbt::Tag;
+    use horizon_protocol::{
+        connection::Pipe,
+        packets::play::{self, Clientbound as C},
+    };
+
+    with_client_game(|game| {
+        let (client, _server) = Pipe::pair();
+        game.connect_local(client, "hide-matched-names").unwrap();
+        let alex = 0x1111_2222_3333_4444_5555_6666_7777_8888u128;
+        game.handle_packet(C::PlayerInfoUpdate(play::PlayerInfoUpdate {
+            actions: 1,
+            entries: vec![play::PlayerInfo {
+                uuid: alex,
+                name: Some("Alex".into()),
+                ..Default::default()
+            }],
+        }))
+        .unwrap();
+        let lines = |game: &super::super::Game| -> Vec<String> {
+            game.remote
+                .as_ref()
+                .unwrap()
+                .chat
+                .iter()
+                .map(|(line, _)| line.clone())
+                .collect()
+        };
+        let system = |content: &str| {
+            C::SystemChat(play::SystemChat {
+                content: Tag::String(content.into()),
+                overlay: false,
+            })
+        };
+        game.settings.file.set(
+            "hideMatchedNames",
+            horizon_client::options_file::V::Bool(true),
+        );
+        game.social.hidden.insert(alex);
+        game.handle_packet(system("<Alex> hello")).unwrap();
+        assert!(lines(game).is_empty(), "a hidden player's line is dropped");
+
+        // `discoveredNamesToUUID` keeps the name after the player list removes the entry.
+        game.handle_packet(C::PlayerInfoRemove(play::PlayerInfoRemove {
+            uuids: vec![alex],
+        }))
+        .unwrap();
+        game.handle_packet(system("<Alex> still there")).unwrap();
+        assert!(lines(game).is_empty(), "the name outlives the list entry");
+
+        // Turning the option off shows the line; a player who is not hidden always shows.
+        game.settings.file.set(
+            "hideMatchedNames",
+            horizon_client::options_file::V::Bool(false),
+        );
+        game.handle_packet(system("<Alex> hello")).unwrap();
+        game.handle_packet(system("<Steve> hi")).unwrap();
+        assert_eq!(lines(game), ["<Alex> hello", "<Steve> hi"]);
+    });
+}
+
 #[test]
 #[ignore = "daily"]
 fn mod_chat_needs_a_joined_player_and_what_the_chat_option_allows() {

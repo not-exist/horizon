@@ -1654,6 +1654,11 @@ impl Game<'_> {
                 // language; mods may change or cancel it. ChatListener.handleOverlay
                 // for the action bar.
                 let mut text = remote_text(&p.content);
+                // ChatListener.handleSystemMessage drops a `<Name> …` line from a
+                // player the Social Interactions screen hides before any hook sees it.
+                if !p.overlay && self.hides_matched_name(&text) {
+                    return Ok(());
+                }
                 if !self.chat_received(true, p.overlay, 0, None, None, &mut text) {
                     return Ok(());
                 }
@@ -1796,6 +1801,7 @@ impl Game<'_> {
             }
             C::DeleteChat(p) => self.handle_delete_chat(&p.signature)?,
             C::PlayerInfoUpdate(p) => {
+                let mut added_players = Vec::new();
                 if let Some(r) = self.remote.as_mut() {
                     // handlePlayerInfoUpdate: new entries first, then every
                     // action on every known entry.
@@ -1810,6 +1816,9 @@ impl Game<'_> {
                     if p.actions & 1 != 0 {
                         for e in &p.entries {
                             if let Some(name) = &e.name {
+                                if !r.tab_players.contains_key(&e.uuid) {
+                                    added_players.push((e.uuid, name.clone()));
+                                }
                                 r.tab_players.entry(e.uuid).or_insert_with(|| {
                                     horizon_client::tab_list::TabPlayer::new(e.uuid, name.clone())
                                 });
@@ -1831,6 +1840,10 @@ impl Game<'_> {
                             }
                         }
                     }
+                }
+                // `PlayerSocialManager.addPlayer` for each new player-list entry.
+                for (id, name) in added_players {
+                    self.social_add_player(id, &name);
                 }
                 for e in p.entries {
                     if mod_api::__private::listened(mod_api::HookId::ClientPlayerChangeGameType)

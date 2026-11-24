@@ -24,6 +24,9 @@ pub(super) struct Social {
     /// `discoveredNamesToUUID`, the other way: the names of the players seen, so a hidden player
     /// who left is still listed by name.
     names: HashMap<u128, String>,
+    /// `PlayerSocialManager.discoveredNamesToUUID`: every player name the tab list has carried,
+    /// kept after they leave, so `guessChatUUID` can match a `<Name>` system line.
+    discovered: HashMap<String, u128>,
     page: Page,
     pub(super) search: EditBox,
     /// `PlayerEntry.TOOLTIP_DELAY`: the row buttons' tooltips wait 500 ms.
@@ -40,6 +43,7 @@ impl Default for Social {
         Self {
             hidden: HashSet::new(),
             names: HashMap::new(),
+            discovered: HashMap::new(),
             page: Page::All,
             search,
             tooltip: Default::default(),
@@ -68,6 +72,33 @@ impl Game<'_> {
                 (super::scoreboard::local_tab_players(me, guests), uuid)
             }
         }
+    }
+    /// `PlayerSocialManager.addPlayer`: the name a new player-list entry carries joins
+    /// `discoveredNamesToUUID`, and stays after the entry is removed.
+    pub(super) fn social_add_player(&mut self, id: u128, name: &str) {
+        self.social.discovered.insert(name.to_owned(), id);
+    }
+    /// `ChatListener.guessChatUUID`: the plain text between the first `<` and the next `>`,
+    /// looked up in `discoveredNamesToUUID`; 0 is `Util.NIL_UUID`.
+    fn guess_chat_uuid(&self, message: &Text) -> u128 {
+        let plain = message.plain();
+        let Some(open) = plain.find('<') else {
+            return 0;
+        };
+        let after = &plain[open + '<'.len_utf8()..];
+        let Some(close) = after.find('>') else {
+            return 0;
+        };
+        self.social.discovered.get(&after[..close]).copied().unwrap_or(0)
+    }
+    /// `ChatListener.handleSystemMessage`'s first check: with Hide Matched Names on (its
+    /// default), a system line whose `<Name>` is a hidden or blocked player is dropped.
+    pub(super) fn hides_matched_name(&mut self, message: &Text) -> bool {
+        if !self.settings.file.bool("hideMatchedNames") {
+            return false;
+        }
+        let id = self.guess_chat_uuid(message);
+        id != 0 && self.social_hides(id)
     }
     /// `Minecraft.isBlocked`: whether a player's chat is hidden by the player
     /// or the account has blocked them (`PlayerSocialManager

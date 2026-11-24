@@ -183,9 +183,8 @@ impl Opt {
     pub(crate) fn available(self) -> bool {
         !matches!(
             self,
-            // Stored, but there are no blocked players or signed chat yet.
-            Opt::HideMatchedNames
-                | Opt::OnlySecureChat
+            // Stored, but signed chat is not enforced yet.
+            Opt::OnlySecureChat
                 // Saved, but no Horizon system reads them yet: no Realms, no
                 // friends list, no directional audio.
                 | Opt::RealmsNotifications
@@ -5156,13 +5155,13 @@ mod tests {
             Opt::ImprovedTransparency,
             Opt::ChatDelay,
             Opt::SaveChatDrafts,
+            Opt::HideMatchedNames,
             Opt::MusicToast,
             Opt::CtrlClickEmulatesRightClick,
         ] {
             assert!(opt.available(), "{opt:?} is read and must be clickable");
         }
         for opt in [
-            Opt::HideMatchedNames,
             Opt::OnlySecureChat,
             Opt::RealmsNotifications,
             Opt::InGameNotification,
