@@ -33,6 +33,29 @@ WINDOWS_WASM_JOB = "verify-windows-wasm-cache"
 VERIFY_NEEDS = (*VERIFY_PARTS, WINDOWS_WASM_JOB, "native-clippy")
 # On Windows the bash on PATH is Git's; a bare "bash" there would be WSL's (tests/test_pr_ready.py).
 BASH = shutil.which("bash")
+
+
+def bash_at_least(major: int, minor: int) -> bool:
+    """Whether the bash on PATH is this version or later. `set -u` treats an empty array as unbound before 4.4, and
+    macOS ships 3.2; the plan step expands one."""
+    if not BASH:
+        return False
+    result = subprocess.run([BASH, "-c", 'echo "${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"'],
+                            capture_output=True, text=True)
+    try:
+        return tuple(int(part) for part in result.stdout.strip().split(".")) >= (major, minor)
+    except ValueError:
+        return False
+
+
+def gnu_date() -> bool:
+    """Whether `date` takes -d, which the spacing step uses; BSD's (macOS's) date does not."""
+    try:
+        return subprocess.run(["date", "-u", "-d", "@0", "+%s"], capture_output=True).returncode == 0
+    except OSError:
+        return False
+
+
 # verify's parts: our checks runners only with SELF_HOSTED_CI=all, Blacksmith's otherwise.
 ONLY_WITH_ALL = re.compile(r"^\$\{\{ vars\.SELF_HOSTED_CI == 'all' && fromJSON\('\[\"self-hosted\", \"linux\", "
                            r"\"horizon-checks\"\]'\) \|\| 'blacksmith-\d+vcpu-ubuntu-2404' \}\}$")
@@ -540,6 +563,7 @@ class HostedParityTests(unittest.TestCase):
             self.assertNotIn("concurrency", job, name)
 
     @unittest.skipUnless(BASH, "needs bash")
+    @unittest.skipUnless(bash_at_least(4, 4), "the plan step expands an empty array under set -u: needs bash 4.4")
     def test_a_push_plans_every_harness_and_tests_its_own_commit(self):
         # The plan step's selection, with tools/parity_plan.py replaced by a stub that prints its arguments.
         run = self.step("The harnesses, in shards by probe", self.plan)["run"].split("\npython3 - <<'EOF'", 1)[0]
@@ -719,6 +743,7 @@ class HostedParityTests(unittest.TestCase):
         self.assertEqual(marker["if"], "steps.spacing.outputs.marker == 'true'")
 
     @unittest.skipUnless(BASH, "needs bash")
+    @unittest.skipUnless(gnu_date(), "the spacing step reads dates with GNU date -d, which BSD date lacks")
     def test_a_push_runs_in_full_only_three_hours_after_the_last_full_push(self):
         step = self.step("Whether this run is due", self.workflow["jobs"]["spacing"]["steps"])
         run = step["run"]
