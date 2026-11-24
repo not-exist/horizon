@@ -49,9 +49,14 @@ def bash_at_least(major: int, minor: int) -> bool:
 
 
 def gnu_date() -> bool:
-    """Whether `date` takes -d, which the spacing step uses; BSD's (macOS's) date does not."""
+    """Whether the spacing step's `date -u -d` reads its stamps: BSD's (macOS's) date takes no -d, and BusyBox's
+    takes `@0` but not the `YYYY-MM-DDTHH:MM:SSZ` stamps the step reads. Probed in the bash the test runs it under,
+    whose PATH is where the step's `date` comes from."""
+    if not BASH:
+        return False
     try:
-        return subprocess.run(["date", "-u", "-d", "@0", "+%s"], capture_output=True).returncode == 0
+        return subprocess.run([BASH, "-c", "date -u -d 2000-01-01T00:00:00Z +%s"],
+                              capture_output=True).returncode == 0
     except OSError:
         return False
 
@@ -407,6 +412,7 @@ class HostedParityTests(unittest.TestCase):
             self.assertEqual(Path(f"{out}.home").read_text(), "")
             self.assertFalse(marker.exists())
 
+    @unittest.skipUnless(BASH, "needs bash")
     def test_the_plans_key_values_are_checked_before_they_name_anything(self):
         # They come from the tested tree (the plan job): the step's own check, run with good and bad values.
         script = self.step("Cache keys")["run"].split("\nh() {", 1)[0]
@@ -743,7 +749,8 @@ class HostedParityTests(unittest.TestCase):
         self.assertEqual(marker["if"], "steps.spacing.outputs.marker == 'true'")
 
     @unittest.skipUnless(BASH, "needs bash")
-    @unittest.skipUnless(gnu_date(), "the spacing step reads dates with GNU date -d, which BSD date lacks")
+    @unittest.skipUnless(gnu_date(), "the spacing step reads stamps with GNU date -d, which BSD's date lacks and "
+                                     "BusyBox's cannot parse")
     def test_a_push_runs_in_full_only_three_hours_after_the_last_full_push(self):
         step = self.step("Whether this run is due", self.workflow["jobs"]["spacing"]["steps"])
         run = step["run"]

@@ -228,12 +228,15 @@ class SyncTests(unittest.TestCase):
                 self.assertIn("es_es (export/es-ES.json): not JSON: nested too deep", err)
 
     def test_a_bracket_in_a_translation_is_not_nesting(self):
+        # At a limit of 1 the flat map is still taken, while a scanner that counted the brackets inside the
+        # translation would measure 2 and refuse it.
         with tempfile.TemporaryDirectory() as tmp:
             root, lang, review, export = self.fixture(tmp)
             write(export, "es-ES.json", {"horizon.a": "Manzana [1]", "horizon.b": "Plátano %s",
                                          "horizon.c": "Cereza"})
-            code, _, err = run("--translations", export, "--approved", root / "approved",
-                               "--lang", lang, "--review", review)
+            with mock.patch.object(crowdin_import, "MAX_NESTING", 1):
+                code, _, err = run("--translations", export, "--approved", root / "approved",
+                                   "--lang", lang, "--review", review)
             self.assertEqual(code, 0, err)
             entries = json.loads((lang / "es_es.json").read_text(encoding="utf-8"))
             self.assertEqual(entries["horizon.a"], "Manzana [1]")
