@@ -34,6 +34,8 @@ pub mod preset_editors;
 mod splash;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod title_request_tests;
 mod world_folder;
 pub mod world_management;
 #[cfg(test)]
@@ -56,6 +58,26 @@ fn edit_top(h: f32) -> f32 {
 }
 pub(crate) fn confirm_top(h: f32, lines: usize) -> f32 {
     ((h.ceil() - 61.0 - lines as f32 * 9.0) / 2.0).floor()
+}
+/// `WorldOpenFlows.confirmWorldCreation`'s ConfirmScreen texts for `lifecycle`:
+/// the title's key and English text, then the question's.
+fn create_warning_text(
+    lifecycle: crate::save::Lifecycle,
+) -> (&'static str, &'static str, &'static str, &'static str) {
+    match lifecycle {
+        crate::save::Lifecycle::Experimental => (
+            "selectWorld.warning.experimental.title",
+            "Warning! These settings are using experimental features",
+            "selectWorld.warning.experimental.question",
+            "These settings are experimental and could one day stop working. Do you wish to proceed?",
+        ),
+        crate::save::Lifecycle::Stable | crate::save::Lifecycle::Deprecated => (
+            "selectWorld.warning.deprecated.title",
+            "Warning! These settings are using deprecated features",
+            "selectWorld.warning.deprecated.question",
+            "Some features used are deprecated and will stop working in the future. Do you wish to proceed?",
+        ),
+    }
 }
 /// RecoverWorldDataScreen's column (title, message, issues, the restore row
 /// and Back, 8 apart, centred on the screen) with `lines` lines of message
@@ -111,13 +133,14 @@ fn recover_issues(dir: &Path) -> [Option<crate::save::DatIssue>; 2] {
 /// `LogoRenderer.extractRenderState`: the logo's top 44 of 64 rows, then the
 /// edition banner's top 14 of 16 rows overlapping its bottom by 7.
 fn draw_logo(atlas: &HudAtlas, batch: &mut HudBatch, w: f32) {
-    batch.sprite_region(
+    batch.texture_blit(
         atlas,
         "gui/title/minecraft",
         [(w / 2.0).floor() - 128.0, 30.0, 256.0, 44.0],
-        256.0,
-        64.0,
+        [0.0; 2],
+        [256.0, 64.0],
     );
+    // The edition banner is generated in the atlas for Horizon's branding.
     batch.sprite_region(
         atlas,
         crate::title_edition::SPRITE,
@@ -389,6 +412,14 @@ pub enum Mode {
         editor: mod_api::PresetEditor,
         dimensions: RefCell<horizon_core::nbt::Tag>,
     },
+    /// `WorldOpenFlows.confirmWorldCreation`'s ConfirmScreen over Create New World:
+    /// the world's settings are not stable, so Create asks before making it.
+    CreateWarning {
+        /// `Lifecycle` of the registries and flags; only its non-stable forms get here.
+        lifecycle: crate::save::Lifecycle,
+        /// The Create New World screen the question stands over, shown again by No.
+        create: Box<Mode>,
+    },
     /// AccessibilityOnboardingScreen: the first screen of a first launch.
     Onboarding(Onboarding),
     /// `BanNoticeScreens`: a ConfirmLinkScreen `Gui.addInitialScreens` queued.
@@ -531,6 +562,7 @@ pub(crate) struct Button {
     label: String,
     enabled: bool,
     id: u8,
+    agent_id: Option<&'static str>,
     icon: Option<(&'static str, f32)>,
     /// `SpriteIconButton.TextAndIcon`: the icon at the right end, the text
     /// centred in the room left of it.
@@ -539,6 +571,11 @@ pub(crate) struct Button {
     action: Option<crate::widgets::Action>,
 }
 impl Button {
+    fn identified(mut self, id: &'static str) -> Self {
+        self.agent_id = Some(id);
+        self
+    }
+
     fn does(mut self, action: crate::widgets::Action) -> Self {
         self.action = Some(action);
         self
@@ -802,6 +839,7 @@ impl Mode {
             Self::CreateFlat { .. } => "world_create_flat",
             Self::CreateBuffet { .. } => "world_create_buffet",
             Self::CreatePreset { .. } => "world_preset_editor",
+            Self::CreateWarning { .. } => "world_create_warning",
             Self::Edit { .. } => "world_edit",
             Self::Backup { .. } => "world_backup",
             Self::BackupBeforeUpgrade { .. } => "world_backup_confirm",
@@ -877,6 +915,27 @@ impl Title {
         }
         self
     }
+    /// The selected splash, if the main title is showing and splash text is enabled.
+    pub fn visible_splash(&self, hide_splash: bool) -> Option<&str> {
+        let splash = self.splash_text(hide_splash)?;
+        if !matches!(self.mode, Mode::Main)
+            || self.preparing
+            || self.rules.borrow().is_some()
+            || self.confirm_experiments.borrow().is_some()
+            || self.experiments.borrow().is_some()
+        {
+            return None;
+        }
+        Some(splash)
+    }
+
+    fn splash_text(&self, hide_splash: bool) -> Option<&str> {
+        if hide_splash {
+            return None;
+        }
+        self.splash.as_deref()
+    }
+
     /// `splashes` is the pool `crate::splashes::pool` built for the current resources.
     pub fn new(saves: PathBuf, resources: &Path, splashes: &str) -> Self {
         use chrono::Datelike;
@@ -968,6 +1027,36 @@ impl Title {
                 selected: None,
             }
         });
+    }
+    /// Multiplayer: TitleScreen.init opens SafetyScreen first, unless it was turned off.
+    pub fn open_server_list(&mut self) {
+        self.set_mode(if self.skip_multiplayer_warning {
+            Mode::Multiplayer(crate::multiplayer::Screen::list(&self.saves))
+        } else {
+            Mode::MultiplayerWarning { check: false }
+        });
+    }
+    /// Create New World from the main page (a native mod's `request_title`): the world generation data is read
+    /// first, as the world list's Create button does (`preparing`), and its Cancel comes back to the main page.
+    pub fn open_new_world(&mut self) {
+        self.create_return_to_main = true;
+        self.preparing = true;
+    }
+    /// Direct Connection's Join for `address` (a native mod's `request_title`): None for an address it would not
+    /// join; otherwise the address is kept as the last direct one and the join is the game's to run.
+    pub fn direct_join(&mut self, address: &str) -> Option<Action> {
+        if !horizon_protocol::servers::is_valid_address(address) {
+            return None;
+        }
+        // Direct Connection keeps what was typed for its next opening (`remember_direct_address`).
+        self.last_server = address.to_owned();
+        let address = crate::multiplayer::direct_address(address);
+        crate::multiplayer::remember_direct_join(&self.saves, &address);
+        Some(Action::Connect {
+            address,
+            lan: false,
+            realm: false,
+        })
     }
     pub(crate) fn new_world(&self) -> Mode {
         Mode::Create {
@@ -1103,6 +1192,7 @@ impl Title {
             if apply {
                 options.world_type = crate::save::WorldPreset::SingleBiomeSurface;
                 options.single_biome = buffet.biome.clone();
+                options.apply_builtin_overworld_edit();
             }
             self.set_mode(Mode::Create {
                 name,
@@ -1129,6 +1219,7 @@ impl Title {
             if apply {
                 options.world_type = crate::save::WorldPreset::Flat;
                 options.flat_settings = Some(flat.settings);
+                options.apply_builtin_overworld_edit();
             }
             self.set_mode(Mode::Create {
                 name,
@@ -1902,6 +1993,22 @@ impl Title {
             options: options.clone(),
         }
     }
+    /// `CreateWorldScreen.onCreate`: Create asks first when the new world's
+    /// settings are not stable (`WorldOpenFlows.confirmWorldCreation`); Yes
+    /// then creates the world, No returns to the screen.
+    fn create_with_confirmation(&mut self) -> Action {
+        let Mode::Create { options, .. } = &self.mode else {
+            return Action::None;
+        };
+        if let Some(lifecycle) = options.create_warning(&self.resources) {
+            self.set_mode(Mode::CreateWarning {
+                lifecycle,
+                create: Box::new(self.mode.clone()),
+            });
+            return Action::None;
+        }
+        self.create_or_upload()
+    }
     /// Create New World's Create: a local world normally; while the Realms screen's
     /// Generate New World tile asked for the screen, its settings go back to that screen
     /// and upload there (`RealmsCreateWorldFlow.createWorld`), no local world made.
@@ -1988,6 +2095,18 @@ impl Title {
                 "create_world",
                 get("selectWorld.create", "Create New World"),
             ),
+            // ConfirmScreen: `getNarrationMessage` joins the title and the question.
+            Mode::CreateWarning { lifecycle, .. } => {
+                let (title, title_fallback, question, question_fallback) =
+                    create_warning_text(*lifecycle);
+                ScreenInfo::new(
+                    "create_world/warning",
+                    join(&[
+                        &get(title, title_fallback),
+                        &get(question, question_fallback),
+                    ]),
+                )
+            }
             Mode::CreatePreset { .. } => ScreenInfo::new(
                 "world_preset_editor",
                 lang::get("selectWorld.customizeType"),
@@ -2486,12 +2605,7 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
                 }
             }
             (Mode::Main, Some(4)) => {
-                // TitleScreen.init: SafetyScreen first, unless it was turned off.
-                self.set_mode(if self.skip_multiplayer_warning {
-                    Mode::Multiplayer(crate::multiplayer::Screen::list(&self.saves))
-                } else {
-                    Mode::MultiplayerWarning { check: false }
-                });
+                self.open_server_list();
                 Action::None
             }
             (Mode::MultiplayerWarning { check }, Some(70)) => {
@@ -2700,6 +2814,9 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
                         );
                         options.set_additional_data_packs(self.additional_data_packs.clone());
                         options.restore_feature_packs(&self.resources, &level);
+                        // CreateWorldScreen.recreated: Create asks about the world's
+                        // experiments, which no Experiments screen confirmed here.
+                        options.recreated = true;
                         self.set_mode(Mode::Create {
                             name: level.name,
                             seed: level.seed.to_string(),
@@ -2904,7 +3021,19 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
                 *self.experiments.get_mut() = Some(experiments::ExperimentsScreen::new(flags));
                 Action::None
             }
-            (Mode::Create { .. }, Some(21)) => self.create_or_upload(),
+            (Mode::Create { .. }, Some(21)) => self.create_with_confirmation(),
+            // ConfirmScreen over Create New World: Yes creates the world, No (and
+            // Escape) returns to the screen it asked over.
+            (Mode::CreateWarning { create, .. }, Some(106)) => {
+                let create = (**create).clone();
+                self.set_mode(create);
+                self.create_or_upload()
+            }
+            (Mode::CreateWarning { create, .. }, Some(107)) => {
+                let create = (**create).clone();
+                self.set_mode(create);
+                Action::None
+            }
             (Mode::Create { options, .. }, Some(31)) => {
                 if options.pack_dir.is_none() {
                     match crate::datapack::temp_folder() {
@@ -3125,9 +3254,12 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
         }
         if matches!(self.mode, Mode::Create { .. }) {
             let upload = self.realms_create.is_some();
-            let action = self.create_or_upload();
-            // A press on Create is a button click: the local world, or the upload.
-            let sound = upload || matches!(action, Action::Create { .. });
+            let action = self.create_with_confirmation();
+            // A press on Create is a button click: the local world, the upload, or
+            // the confirm screen that asks first.
+            let sound = upload
+                || matches!(action, Action::Create { .. })
+                || matches!(self.mode, Mode::CreateWarning { .. });
             return (action, sound);
         }
         match &self.mode {
@@ -3736,6 +3868,11 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
             return;
         }
         if self.experiments.get_mut().take().is_some() {
+            return;
+        }
+        // ConfirmScreen.keyPressed: Escape answers no, which shows the screen again.
+        if let Mode::CreateWarning { create, .. } = &self.mode {
+            self.set_mode((**create).clone());
             return;
         }
         if let Some(rules) = self.rules.get_mut() {

@@ -1,0 +1,39 @@
+# A throwaway check for a fork without the repository's Blacksmith or self-hosted
+# runners: the same fmt, clippy (the touched crate, library and gameplay targets),
+# title tests and tree checks on GitHub-hosted Ubuntu. Not for a pull request to the
+# main repository.
+name: fork-check
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  # Smaller, faster build folders on a hosted runner's disk; neither clippy nor a
+  # test result depends on debug information.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: toolchain components and system packages
+        run: |
+          rustup component add rustfmt clippy
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libudev-dev
+      - name: format
+        run: cargo fmt --all -- --check
+      - name: clippy (horizon-client, library, gameplay and tests)
+        run: cargo clippy -p horizon-client --lib --bins --tests --locked -- -D warnings
+      - name: title tests
+        run: "cargo test -p horizon-client --lib --locked title::tests::"
+      - name: Python tests
+        run: python3 -m unittest discover -s tests
+      - name: tree and layers
+        run: |
+          python3 tools/check_public_tree.py
+          python3 tools/check_layers.py

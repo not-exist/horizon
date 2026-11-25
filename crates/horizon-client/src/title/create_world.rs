@@ -11,13 +11,79 @@ use crate::{
 const TAB_BAR: f32 = 24.0;
 /// HeaderAndFooterLayout's default footer height.
 const FOOTER: f32 = 33.0;
-const TABS: [&str; 3] = [
-    "createWorld.tab.game.title",
-    "createWorld.tab.world.title",
-    "createWorld.tab.more.title",
+const TABS: [(&str, &str); 3] = [
+    ("createWorld.tab.game.title", "game"),
+    ("createWorld.tab.world.title", "world"),
+    ("createWorld.tab.more.title", "more"),
 ];
 /// Difficulty ids, in the cycle button's order.
 pub const DIFFICULTIES: [&str; 4] = ["peaceful", "easy", "normal", "hard"];
+/// The registries `RegistryDataLoader` loads from packs for a new world
+/// (`WORLD_REGISTRIES` then `DIMENSION_REGISTRIES`), as their folders under
+/// `data/<namespace>/`. An element a pack outside the vanilla jar adds to one
+/// of them is registered experimental (`KnownPack.isVanilla`), so the
+/// composite registry access is experimental too.
+const PACK_REGISTRIES: &[&str] = &[
+    "dimension_type",
+    "worldgen/biome",
+    "chat_type",
+    "worldgen/carver",
+    "worldgen/feature",
+    "worldgen/placed_feature",
+    "worldgen/structure",
+    "worldgen/structure_set",
+    "worldgen/processor_list",
+    "worldgen/template_pool",
+    "worldgen/noise_settings",
+    "worldgen/noise",
+    "worldgen/density_function",
+    "worldgen/material_rule",
+    "worldgen/material_condition",
+    "worldgen/world_preset",
+    "worldgen/flat_level_generator_preset",
+    "trim_pattern",
+    "trim_material",
+    "trial_spawner",
+    "wolf_variant",
+    "wolf_sound_variant",
+    "pig_variant",
+    "pig_sound_variant",
+    "frog_variant",
+    "cat_variant",
+    "cat_sound_variant",
+    "cow_variant",
+    "cow_sound_variant",
+    "sulfur_cube_archetype",
+    "chicken_variant",
+    "chicken_sound_variant",
+    "zombie_nautilus_variant",
+    "painting_variant",
+    "damage_type",
+    "worldgen/multi_noise_biome_source_parameter_list",
+    "banner_pattern",
+    "enchantment",
+    "enchantment_provider",
+    "jukebox_song",
+    "instrument",
+    "test_environment",
+    "test_instance",
+    "dialog",
+    "world_clock",
+    "timeline",
+    "villager_trade",
+    "trade_set",
+    "decorated_pot_pattern",
+    "block_transformer",
+    "worldgen/block_state_provider",
+    "dimension",
+];
+
+/// Whether a restored dimension snapshot also records its original preset id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestoredPreset {
+    Named,
+    Unnamed,
+}
 
 /// WorldCreationUiState beyond the name and seed.
 #[derive(Clone, Debug, PartialEq)]
@@ -26,6 +92,8 @@ pub struct WorldOptions {
     pub custom_preset: Option<String>,
     /// Committed editor output, saved as the world's dimension stems.
     pub preset_dimensions: Option<horizon_core::nbt::Tag>,
+    /// A saved choice persists through pack refresh until World Type is changed.
+    pub restored_preset: Option<RestoredPreset>,
     /// Available enabled data-pack presets, refreshed when the pack selection changes.
     pub presets: std::collections::BTreeMap<String, horizon_core::nbt::Tag>,
     /// The enabled `minecraft:normal` world-preset tag's selection order.
@@ -59,6 +127,10 @@ pub struct WorldOptions {
     /// Alt is held (`CycleButton.DEFAULT_ALT_LIST_SELECTOR`): the world type
     /// button cycles the extended list, with Debug Mode.
     pub alt_down: bool,
+    /// `CreateWorldScreen.recreated`: the Re-Create button opened this screen. Not
+    /// a world setting: it only decides whether Create asks about the world's
+    /// settings (`WorldOpenFlows.confirmWorldCreation`'s `skipWarning`).
+    pub recreated: bool,
 }
 impl crate::save::WorldPreset {
     /// `WorldPresetTags.EXTENDED`: the list the button cycles while Alt is held.
@@ -98,6 +170,7 @@ impl Default for WorldOptions {
         Self {
             custom_preset: None,
             preset_dimensions: None,
+            restored_preset: None,
             presets: Default::default(),
             preset_order: crate::save::WorldPreset::ALL
                 .iter()
@@ -117,6 +190,7 @@ impl Default for WorldOptions {
             pack_dir: None,
             additional_data_packs: std::sync::Arc::from([]),
             alt_down: false,
+            recreated: false,
         }
     }
 }
@@ -166,6 +240,19 @@ impl WorldOptions {
         registry: std::sync::Arc<crate::gamerules::RuleRegistry>,
     ) -> Self {
         let generation = crate::save::WorldGen::read(dir).unwrap_or_default();
+        let (preset, preset_dimensions, restored_preset) = match crate::save::read_saved_preset(dir)
+        {
+            Some((preset, dimensions)) => {
+                let restored = if preset.is_some() {
+                    RestoredPreset::Named
+                } else {
+                    RestoredPreset::Unnamed
+                };
+                (preset, Some(dimensions), Some(restored))
+            }
+            None => (None, None, None),
+        };
+        let vanilla_preset = preset.as_deref().and_then(crate::save::WorldPreset::of_id);
         let (pack_dir, data_packs) = crate::datapack::for_recreate(dir);
         Self {
             hardcore: level.hardcore,
@@ -174,7 +261,10 @@ impl WorldOptions {
                 .position(|d| *d == level.difficulty)
                 .unwrap_or(2),
             commands: Some(commands),
-            world_type: generation.preset,
+            custom_preset: preset.filter(|_| vanilla_preset.is_none()),
+            preset_dimensions,
+            restored_preset,
+            world_type: vanilla_preset.unwrap_or(generation.preset),
             single_biome: fixed_biome(dir).unwrap_or_else(|| "minecraft:plains".into()),
             flat_settings: (generation.preset == crate::save::WorldPreset::Flat)
                 .then(|| super::flat::FlatSettings::from_world(dir))
@@ -260,6 +350,93 @@ impl WorldOptions {
         features.sort();
         features.dedup();
         features
+    }
+    /// The selected packs in priority order, lowest first (`data_packs`): the built-in
+    /// pack, the jar's feature packs, the additional repository sources and the
+    /// `mcworld-` folder's packs, as the Data Packs screen lists them.
+    fn selected_packs(&self, resources: &std::path::Path) -> Vec<crate::datapack::DataPack> {
+        let mut available = vec![crate::datapack::DataPack::builtin(resources)];
+        available.extend(crate::datapack::feature_packs(resources));
+        available.extend(
+            self.additional_data_packs
+                .iter()
+                .map(|pack| (**pack).clone()),
+        );
+        if let Some(dir) = &self.pack_dir {
+            available.extend(crate::datapack::discover_folder(dir));
+        }
+        self.data_packs
+            .iter()
+            .filter_map(|id| available.iter().find(|pack| &pack.id == id).cloned())
+            .collect()
+    }
+    /// `FeatureFlags.isExperimental(enabledFeatures)`: a flag other than
+    /// `minecraft:vanilla` is on.
+    fn feature_lifecycle(&self, resources: &std::path::Path) -> crate::save::Lifecycle {
+        use crate::save::Lifecycle;
+        if self
+            .enabled_features(resources)
+            .iter()
+            .any(|flag| flag != "minecraft:vanilla")
+        {
+            Lifecycle::Experimental
+        } else {
+            Lifecycle::Stable
+        }
+    }
+    /// The lifecycle the new world's registries load with: `WorldDimensions.bake` over the
+    /// chosen preset's dimensions and the selected packs' `dimension/` files, then every
+    /// other registry those packs fill (`allRegistriesLifecycle`).
+    fn registry_lifecycle(&self, resources: &std::path::Path) -> crate::save::Lifecycle {
+        use crate::save::Lifecycle;
+        let packs = self.selected_packs(resources);
+        let selected: Vec<&crate::datapack::DataPack> = packs.iter().collect();
+        let stems: Vec<(String, horizon_core::nbt::Tag)> =
+            crate::datapack::dimension_stems(&selected)
+                .into_iter()
+                .map(|(id, json)| (id, crate::save::json_tag(&json)))
+                .collect();
+        let dimensions = self.dimensions().or_else(|| {
+            crate::save::new_world_gen_settings(
+                0,
+                self.world_gen(),
+                self.flat_settings(),
+                self.single_biome(),
+            )
+            .get("dimensions")
+            .cloned()
+        });
+        if crate::save::dimensions_lifecycle(dimensions.as_ref(), &stems) != Lifecycle::Stable {
+            return Lifecycle::Experimental;
+        }
+        // Packs from the jar are the only ones registered as vanilla (`KnownPack.vanilla`);
+        // an element any other selected pack adds to a pack-loaded registry is experimental.
+        let builtin: Vec<String> = crate::datapack::feature_packs(resources)
+            .into_iter()
+            .map(|pack| pack.id)
+            .collect();
+        for pack in &packs {
+            if pack.id == "vanilla" || builtin.contains(&pack.id) {
+                continue;
+            }
+            if !pack.list_kinds(PACK_REGISTRIES).is_empty() {
+                return Lifecycle::Experimental;
+            }
+        }
+        Lifecycle::Stable
+    }
+    /// `WorldOpenFlows.confirmWorldCreation`: the lifecycle to confirm before creating
+    /// the world, or `None` to create it at once. `skipWarning` hides a new world's
+    /// experiment flags, which the Experiments screen already confirmed; a
+    /// re-created world never went through that screen.
+    pub fn create_warning(&self, resources: &std::path::Path) -> Option<crate::save::Lifecycle> {
+        use crate::save::Lifecycle;
+        let registries = self.registry_lifecycle(resources);
+        let lifecycle = registries.add(self.feature_lifecycle(resources));
+        if lifecycle == Lifecycle::Stable {
+            return None;
+        }
+        (self.recreated || registries != Lifecycle::Stable).then_some(lifecycle)
     }
     /// `getDifficulty`: Hardcore is always Hard.
     pub fn difficulty(&self) -> usize {
@@ -472,6 +649,7 @@ pub(super) fn buttons(
         label,
         enabled,
         id,
+        agent_id: None,
         icon: None,
         trailing: None,
         action: None,
@@ -486,7 +664,8 @@ pub(super) fn buttons(
                 labelled("selectWorld.gameMode", tr(game_mode(creative, o.hardcore))),
                 true,
                 20,
-            ),
+            )
+            .identified("game-mode"),
             b(
                 gx,
                 gy + 69.0,
@@ -500,7 +679,8 @@ pub(super) fn buttons(
                 ),
                 !o.hardcore,
                 23,
-            ),
+            )
+            .identified("difficulty"),
             b(
                 gx,
                 gy + 97.0,
@@ -508,7 +688,8 @@ pub(super) fn buttons(
                 labelled("selectWorld.allowCommands", on_off(o.commands(creative))),
                 !o.hardcore,
                 24,
-            ),
+            )
+            .identified("allow-cheats"),
         ],
         1 => vec![
             b(
@@ -518,7 +699,8 @@ pub(super) fn buttons(
                 labelled("selectWorld.mapType", o.preset_label()),
                 true,
                 25,
-            ),
+            )
+            .identified("world-type"),
             // PresetEditor.EDITORS: flat worlds have CreateFlatWorldScreen, the
             // single-biome preset CreateBuffetWorldScreen; the other presets
             // have no editor, so the button is disabled for them.
@@ -535,9 +717,11 @@ pub(super) fn buttons(
                                 | crate::save::WorldPreset::SingleBiomeSurface
                         )),
                 26,
-            ),
+            )
+            .identified("customize"),
             // SwitchGrid: 44-wide value-only buttons at the grid's right.
-            b(gx + 266.0, gy + 73.0, 44.0, on_off(o.structures), true, 27),
+            b(gx + 266.0, gy + 73.0, 44.0, on_off(o.structures), true, 27)
+                .identified("generate-structures"),
             b(
                 gx + 266.0,
                 gy + 97.0,
@@ -545,30 +729,36 @@ pub(super) fn buttons(
                 on_off(o.bonus_chest()),
                 !o.hardcore,
                 28,
-            ),
+            )
+            .identified("bonus-chest"),
         ],
         // The More tab, as vanilla lays it out: Game Rules, Experiments
         // (the resources' feature packs), Data Packs.
         _ => [
-            "selectWorld.gameRules",
-            "selectWorld.experiments",
-            "selectWorld.dataPacks",
+            ("selectWorld.gameRules", "game-rules"),
+            ("selectWorld.experiments", "experiments"),
+            ("selectWorld.dataPacks", "data-packs"),
         ]
-        .iter()
+        .into_iter()
         .enumerate()
-        .map(|(i, key)| b(gx, gy + 28.0 * i as f32, 210.0, tr(key), true, 29 + i as u8))
+        .map(|(i, (key, id))| {
+            b(gx, gy + 28.0 * i as f32, 210.0, tr(key), true, 29 + i as u8).identified(id)
+        })
         .collect(),
     };
     // The footer: two 150-wide buttons 8 apart, centred in its 33 pixels.
     let x = ((w - 308.0) * 0.5).trunc();
-    buttons.push(b(
-        x,
-        h - 27.0,
-        150.0,
-        crate::lang::get_or("selectWorld.create", "Create New World"),
-        true,
-        21,
-    ));
+    buttons.push(
+        b(
+            x,
+            h - 27.0,
+            150.0,
+            crate::lang::get_or("selectWorld.create", "Create New World"),
+            true,
+            21,
+        )
+        .identified("create-new-world"),
+    );
     buttons.push(
         b(
             x + 158.0,
@@ -578,6 +768,7 @@ pub(super) fn buttons(
             true,
             22,
         )
+        .identified("cancel")
         .does(crate::widgets::Action::Cancel),
     );
     buttons
@@ -702,7 +893,7 @@ impl Title {
         crate::widgets::narratable(|| {
             use crate::widgets::{ListKind, Narratable, Row};
             let tab = |i: usize| {
-                let mut row = Row::new(i, tr(TABS[i]));
+                let mut row = Row::new(i, tr(TABS[i].0));
                 row.hint = Some(String::new());
                 row
             };
@@ -729,11 +920,17 @@ impl Title {
                 u32::MAX,
             );
         }
-        for (i, key) in TABS.iter().enumerate() {
+        for (i, &(key, id)) in TABS.iter().enumerate() {
             let x = x0 + tw * i as f32;
             let selected = o.tab == i;
             let label = Text::translate(key, &[]);
-            crate::widgets::record(&label.plain(), [x, 0.0, tw, TAB_BAR], true);
+            crate::widgets::record_with_id(
+                Some(id),
+                &label.plain(),
+                [x, 0.0, tw, TAB_BAR],
+                true,
+                crate::widgets::Kind::Button,
+            );
             crate::widgets::target_as([x, 0.0, tw, TAB_BAR], crate::widgets::Kind::Tab(selected));
             let sprite = match (selected, ui::hovered(cursor, x, 0.0, tw, TAB_BAR)) {
                 (true, true) => "gui/sprites/widget/tab_selected_highlighted",
