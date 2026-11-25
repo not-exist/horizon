@@ -30,7 +30,7 @@ jobs:
       - name: clippy (horizon-client, library, gameplay and tests)
         run: cargo clippy -p horizon-client --lib --bins --tests --locked -- -D warnings
       - name: title tests
-        run: cargo test -p horizon-client --lib --locked title::tests::
+        run: "cargo test -p horizon-client --lib --locked title::tests::"
       - name: Python tests
         run: python3 -m unittest discover -s tests
       - name: tree and layers
