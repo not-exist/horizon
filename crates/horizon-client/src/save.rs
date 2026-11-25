@@ -443,36 +443,67 @@ fn datapack_dimensions(world: &Path) -> Vec<(String, Tag)> {
         .map(|(id, json)| (id, json_tag(&json)))
         .collect()
 }
-/// `data.worldGenSettingsLifecycle() != Lifecycle.stable()` (`WorldDimensions.bake`): the known
-/// dimensions (the saved ones and the enabled data packs', a pack's replacing the saved one of
-/// its id) lack one of the three builtin ones, or have one that is not the vanilla one.
-pub fn world_gen_unstable(world: &Path) -> bool {
-    let saved = world_gen_settings(world)
-        .as_ref()
-        .and_then(|s| s.get("dimensions"))
-        .cloned();
-    let stems = datapack_dimensions(world);
-    if saved.is_none() && stems.is_empty() {
-        return false;
+/// `com.mojang.serialization.Lifecycle`: how stable decoded data is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lifecycle {
+    Stable,
+    /// `Lifecycle.experimental()`: the data may change or stop loading.
+    Experimental,
+    /// `Lifecycle.deprecated()`: older data that will stop loading. The version a
+    /// `Lifecycle.deprecated(since)` was deprecated in is not kept: `add` treats it
+    /// the way vanilla does when the two agree.
+    Deprecated,
+}
+impl Lifecycle {
+    /// `Lifecycle.add`: the less stable of the two.
+    pub fn add(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Experimental, _) | (_, Self::Experimental) => Self::Experimental,
+            (Self::Deprecated, _) | (_, Self::Deprecated) => Self::Deprecated,
+            (Self::Stable, Self::Stable) => Self::Stable,
+        }
     }
-    let mut dimensions: std::collections::BTreeMap<String, Tag> = match saved {
-        Some(Tag::Compound(saved)) => saved
-            .into_iter()
-            .map(|(key, dimension)| (key.to_string_lossy(), dimension))
+}
+/// `WorldDimensions.bake(datapackDimensions)`: the lifecycle of the level-stem registry
+/// `dimensions` (the selected preset) and the data packs' `stems` bake into. A stem replaces a
+/// selected dimension of its id (`baseDimensions.getOptional(key).or(saved)`), and the registry
+/// is experimental without one of the three builtin stems or with a stem that is not the vanilla
+/// one (`checkStability`, added per registered entry).
+pub fn dimensions_lifecycle(dimensions: Option<&Tag>, stems: &[(String, Tag)]) -> Lifecycle {
+    let mut levels: std::collections::BTreeMap<String, Tag> = match dimensions {
+        Some(Tag::Compound(dimensions)) => dimensions
+            .iter()
+            .map(|(key, dimension)| (key.to_string_lossy(), dimension.clone()))
             .collect(),
         _ => std::collections::BTreeMap::new(),
     };
-    // `baseDimensions.getOptional(key).or(saved)`.
-    dimensions.extend(stems);
+    levels.extend(stems.iter().cloned());
     let builtin = [
         "minecraft:overworld",
         "minecraft:the_nether",
         "minecraft:the_end",
     ];
-    builtin.iter().any(|key| !dimensions.contains_key(*key))
-        || dimensions
+    if builtin.iter().any(|key| !levels.contains_key(*key))
+        || levels
             .iter()
             .any(|(key, dimension)| !dimension_is_vanilla_like(key, dimension))
+    {
+        Lifecycle::Experimental
+    } else {
+        Lifecycle::Stable
+    }
+}
+/// `data.worldGenSettingsLifecycle() != Lifecycle.stable()` (`WorldDimensions.bake`): the known
+/// dimensions (the saved ones and the enabled data packs', a pack's replacing the saved one of
+/// its id) lack one of the three builtin ones, or have one that is not the vanilla one.
+pub fn world_gen_unstable(world: &Path) -> bool {
+    let settings = world_gen_settings(world);
+    let saved = settings.as_ref().and_then(|s| s.get("dimensions"));
+    let stems = datapack_dimensions(world);
+    if saved.is_none() && stems.is_empty() {
+        return false;
+    }
+    dimensions_lifecycle(saved, &stems) != Lifecycle::Stable
 }
 /// Move a world saved by an older Horizon build (pre-26.3 layout with a
 /// DataVersion that keeps vanilla from upgrading it) into the 26.3 layout.

@@ -675,6 +675,13 @@ impl Game<'_> {
                 "generate_structures": options.structures,
                 "bonus_chest": options.bonus_chest(),
             }),
+            Mode::CreateWarning { lifecycle, .. } => json!({
+                "mode": "create-world-warning",
+                "lifecycle": match lifecycle {
+                    horizon_client::save::Lifecycle::Experimental => "experimental",
+                    _ => "deprecated",
+                },
+            }),
             Mode::CreateFlat {
                 name,
                 seed,

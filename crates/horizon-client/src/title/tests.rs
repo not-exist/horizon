@@ -796,6 +796,94 @@ fn recreate_uses_existing_name_seed_and_mode_and_scroll_reaches_later_rows() {
     );
 }
 
+/// A feature pack the jar ships (`ServerPacksSource`), off until a world selects it.
+fn experiment_pack(root: &std::path::Path) {
+    let pack = root.join("data/minecraft/datapacks/experiment");
+    fs::create_dir_all(pack.join("data/example")).unwrap();
+    fs::write(
+        pack.join("pack.mcmeta"),
+        r#"{"pack":{"description":"test experiment"},"features":{"enabled":["example:experiment"]}}"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn recreating_an_experimental_world_confirms_before_creating() {
+    let mut f = Fixture::new();
+    experiment_pack(&f.root);
+    // The saved world was made with that experiment on.
+    let mut level = crate::save::Level {
+        name: "World".into(),
+        ..Default::default()
+    };
+    level.enabled_features = [
+        "minecraft:vanilla".to_owned(),
+        "example:experiment".to_owned(),
+    ]
+    .into();
+    level.write(&f.title.saves.join("World")).unwrap();
+    f.select();
+    f.click("Re-Create");
+    let Mode::Create { options, .. } = &f.title.mode else {
+        panic!("Re-Create opens Create World")
+    };
+    assert!(options.recreated);
+    // Create asks first; No (and Escape) keeps the screen, Yes creates the world.
+    assert_eq!(f.click("Create New World"), Action::None);
+    assert!(matches!(f.title.mode, Mode::CreateWarning { .. }));
+    f.title.escape();
+    assert!(matches!(f.title.mode, Mode::Create { .. }));
+    assert_eq!(f.click("Create New World"), Action::None);
+    assert!(matches!(f.click("Yes"), Action::Create { .. }));
+}
+
+#[test]
+fn a_new_world_with_a_data_pack_dimension_confirms_before_creating() {
+    let mut f = Fixture::new();
+    let packs = f.root.join("temp-packs");
+    let pack = packs.join("void");
+    fs::create_dir_all(pack.join("data/example/dimension")).unwrap();
+    fs::write(
+        pack.join("pack.mcmeta"),
+        r#"{"pack":{"description":"test dimension"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        pack.join("data/example/dimension/void.json"),
+        r#"{"type":"minecraft:the_end","generator":{"type":"minecraft:noise","settings":"minecraft:end","biome_source":{"type":"minecraft:the_end"}}}"#,
+    )
+    .unwrap();
+    f.title.enter_singleplayer();
+    let Mode::Create { options, .. } = &mut f.title.mode else {
+        panic!("the empty list opens Create World")
+    };
+    options.pack_dir = Some(packs);
+    options.data_packs = vec!["vanilla".into(), "file/void".into()];
+    assert_eq!(f.click("Create New World"), Action::None);
+    assert!(matches!(
+        f.title.mode,
+        Mode::CreateWarning {
+            lifecycle: crate::save::Lifecycle::Experimental,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_new_worlds_experiments_were_confirmed_on_the_experiments_screen() {
+    let mut f = Fixture::new();
+    experiment_pack(&f.root);
+    f.title.enter_singleplayer();
+    let Mode::Create { options, .. } = &mut f.title.mode else {
+        panic!("the empty list opens Create World")
+    };
+    // The Experiments screen asked when the pack was picked (`skipWarning`).
+    options.pack_dir = None;
+    options.data_packs = vec!["vanilla".into(), "experiment".into()];
+    assert_eq!(options.create_warning(&f.title.resources), None);
+    assert!(matches!(f.click("Create New World"), Action::Create { .. }));
+}
+
 #[test]
 fn only_the_vertical_wheel_cycles_a_create_world_button() {
     let mut f = Fixture::new();

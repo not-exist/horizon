@@ -396,6 +396,32 @@ impl Title {
                     .does(crate::widgets::Action::Back),
                 ]
             }
+            Mode::CreateWarning { .. } => {
+                // ConfirmScreen.init: the title, the wrapped question, then the buttons
+                // 16 below it (see `confirm_top`).
+                let y = confirm_top(h, self.message_lines.get())
+                    + 41.0
+                    + self.message_lines.get() as f32 * 9.0;
+                vec![
+                    b(
+                        (w / 2.0).floor() - 152.0,
+                        y,
+                        150.0,
+                        &lang::get_or("gui.yes", "Yes"),
+                        true,
+                        106,
+                    ),
+                    b(
+                        (w / 2.0).floor() + 2.0,
+                        y,
+                        150.0,
+                        &lang::get_or("gui.no", "No"),
+                        true,
+                        107,
+                    )
+                    .does(crate::widgets::Action::Back),
+                ]
+            }
             Mode::MissingMods { .. } => {
                 let (_, _, narrow) = missing_mods::layout(w, h);
                 let button_width = if narrow { (w - 20.0).min(300.0) } else { 150.0 };

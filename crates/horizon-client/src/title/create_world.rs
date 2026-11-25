@@ -18,6 +18,65 @@ const TABS: [(&str, &str); 3] = [
 ];
 /// Difficulty ids, in the cycle button's order.
 pub const DIFFICULTIES: [&str; 4] = ["peaceful", "easy", "normal", "hard"];
+/// The registries `RegistryDataLoader` loads from packs for a new world
+/// (`WORLD_REGISTRIES` then `DIMENSION_REGISTRIES`), as their folders under
+/// `data/<namespace>/`. An element a pack outside the vanilla jar adds to one
+/// of them is registered experimental (`KnownPack.isVanilla`), so the
+/// composite registry access is experimental too.
+const PACK_REGISTRIES: &[&str] = &[
+    "dimension_type",
+    "worldgen/biome",
+    "chat_type",
+    "worldgen/carver",
+    "worldgen/feature",
+    "worldgen/placed_feature",
+    "worldgen/structure",
+    "worldgen/structure_set",
+    "worldgen/processor_list",
+    "worldgen/template_pool",
+    "worldgen/noise_settings",
+    "worldgen/noise",
+    "worldgen/density_function",
+    "worldgen/material_rule",
+    "worldgen/material_condition",
+    "worldgen/world_preset",
+    "worldgen/flat_level_generator_preset",
+    "trim_pattern",
+    "trim_material",
+    "trial_spawner",
+    "wolf_variant",
+    "wolf_sound_variant",
+    "pig_variant",
+    "pig_sound_variant",
+    "frog_variant",
+    "cat_variant",
+    "cat_sound_variant",
+    "cow_variant",
+    "cow_sound_variant",
+    "sulfur_cube_archetype",
+    "chicken_variant",
+    "chicken_sound_variant",
+    "zombie_nautilus_variant",
+    "painting_variant",
+    "damage_type",
+    "worldgen/multi_noise_biome_source_parameter_list",
+    "banner_pattern",
+    "enchantment",
+    "enchantment_provider",
+    "jukebox_song",
+    "instrument",
+    "test_environment",
+    "test_instance",
+    "dialog",
+    "world_clock",
+    "timeline",
+    "villager_trade",
+    "trade_set",
+    "decorated_pot_pattern",
+    "block_transformer",
+    "worldgen/block_state_provider",
+    "dimension",
+];
 
 /// Whether a restored dimension snapshot also records its original preset id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +127,10 @@ pub struct WorldOptions {
     /// Alt is held (`CycleButton.DEFAULT_ALT_LIST_SELECTOR`): the world type
     /// button cycles the extended list, with Debug Mode.
     pub alt_down: bool,
+    /// `CreateWorldScreen.recreated`: the Re-Create button opened this screen. Not
+    /// a world setting: it only decides whether Create asks about the world's
+    /// settings (`WorldOpenFlows.confirmWorldCreation`'s `skipWarning`).
+    pub recreated: bool,
 }
 impl crate::save::WorldPreset {
     /// `WorldPresetTags.EXTENDED`: the list the button cycles while Alt is held.
@@ -127,6 +190,7 @@ impl Default for WorldOptions {
             pack_dir: None,
             additional_data_packs: std::sync::Arc::from([]),
             alt_down: false,
+            recreated: false,
         }
     }
 }
@@ -286,6 +350,93 @@ impl WorldOptions {
         features.sort();
         features.dedup();
         features
+    }
+    /// The selected packs in priority order, lowest first (`data_packs`): the built-in
+    /// pack, the jar's feature packs, the additional repository sources and the
+    /// `mcworld-` folder's packs, as the Data Packs screen lists them.
+    fn selected_packs(&self, resources: &std::path::Path) -> Vec<crate::datapack::DataPack> {
+        let mut available = vec![crate::datapack::DataPack::builtin(resources)];
+        available.extend(crate::datapack::feature_packs(resources));
+        available.extend(
+            self.additional_data_packs
+                .iter()
+                .map(|pack| (**pack).clone()),
+        );
+        if let Some(dir) = &self.pack_dir {
+            available.extend(crate::datapack::discover_folder(dir));
+        }
+        self.data_packs
+            .iter()
+            .filter_map(|id| available.iter().find(|pack| &pack.id == id).cloned())
+            .collect()
+    }
+    /// `FeatureFlags.isExperimental(enabledFeatures)`: a flag other than
+    /// `minecraft:vanilla` is on.
+    fn feature_lifecycle(&self, resources: &std::path::Path) -> crate::save::Lifecycle {
+        use crate::save::Lifecycle;
+        if self
+            .enabled_features(resources)
+            .iter()
+            .any(|flag| flag != "minecraft:vanilla")
+        {
+            Lifecycle::Experimental
+        } else {
+            Lifecycle::Stable
+        }
+    }
+    /// The lifecycle the new world's registries load with: `WorldDimensions.bake` over the
+    /// chosen preset's dimensions and the selected packs' `dimension/` files, then every
+    /// other registry those packs fill (`allRegistriesLifecycle`).
+    fn registry_lifecycle(&self, resources: &std::path::Path) -> crate::save::Lifecycle {
+        use crate::save::Lifecycle;
+        let packs = self.selected_packs(resources);
+        let selected: Vec<&crate::datapack::DataPack> = packs.iter().collect();
+        let stems: Vec<(String, horizon_core::nbt::Tag)> =
+            crate::datapack::dimension_stems(&selected)
+                .into_iter()
+                .map(|(id, json)| (id, crate::save::json_tag(&json)))
+                .collect();
+        let dimensions = self.dimensions().or_else(|| {
+            crate::save::new_world_gen_settings(
+                0,
+                self.world_gen(),
+                self.flat_settings(),
+                self.single_biome(),
+            )
+            .get("dimensions")
+            .cloned()
+        });
+        if crate::save::dimensions_lifecycle(dimensions.as_ref(), &stems) != Lifecycle::Stable {
+            return Lifecycle::Experimental;
+        }
+        // Packs from the jar are the only ones registered as vanilla (`KnownPack.vanilla`);
+        // an element any other selected pack adds to a pack-loaded registry is experimental.
+        let builtin: Vec<String> = crate::datapack::feature_packs(resources)
+            .into_iter()
+            .map(|pack| pack.id)
+            .collect();
+        for pack in &packs {
+            if pack.id == "vanilla" || builtin.contains(&pack.id) {
+                continue;
+            }
+            if !pack.list_kinds(PACK_REGISTRIES).is_empty() {
+                return Lifecycle::Experimental;
+            }
+        }
+        Lifecycle::Stable
+    }
+    /// `WorldOpenFlows.confirmWorldCreation`: the lifecycle to confirm before creating
+    /// the world, or `None` to create it at once. `skipWarning` hides a new world's
+    /// experiment flags, which the Experiments screen already confirmed; a
+    /// re-created world never went through that screen.
+    pub fn create_warning(&self, resources: &std::path::Path) -> Option<crate::save::Lifecycle> {
+        use crate::save::Lifecycle;
+        let registries = self.registry_lifecycle(resources);
+        let lifecycle = registries.add(self.feature_lifecycle(resources));
+        if lifecycle == Lifecycle::Stable {
+            return None;
+        }
+        (self.recreated || registries != Lifecycle::Stable).then_some(lifecycle)
     }
     /// `getDifficulty`: Hardcore is always Hard.
     pub fn difficulty(&self) -> usize {
